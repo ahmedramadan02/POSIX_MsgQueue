@@ -2,6 +2,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+static void ErrorReport(const char*);
+
 //TODO: use POSIX APIs instead of kernel space SYSV IPC
 //It's there for backword compatibility
 

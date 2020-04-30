@@ -1,5 +1,18 @@
+/********************************************************************************
+Main.c is the main file to implement the application 
+The main purpose is to use SYSV IPC Msg Queues, pthreads, POSIX timers and signals 
+Current Version: V2.0
+History:
+V1.0: Initial application version
+V2.0: 
+1. Resolved BUG_01: parent is not working
+2. Resolved BUG_02: Ctrl-C interrupt handling for safe termination
+3. little refactoring
+*********************************************************************************/
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/types.h>
@@ -13,39 +26,55 @@
 #include "my_types.h"
 #include "sysv_msg.h"
 
-//TODO: Refactoring, then refactoring, then refactoring
+//Set by the signal handler for safe terminaton
+uint8_t terminationflag = 0; 
+static void terminationHanlder(int, siginfo_t*, void*);
 
 static pid_t childPid, parentPid;
 static timer_t timerId;
-static CurrentLifeTime = 0;
-static ChildAge = 0;
+static unsigned int CurrentLifeTime = 0;
+static unsigned int ChildAge = 0;
 
 //File stuff
 static const char* logfile = "parentLogs.txt";
-int fd;//log file descriptor
+static int fd;//log file descriptor
 static int WriteLogToFile(const char* log, int _fd);
 static int openfile();
 
-//This is accesses in the timer handler context
-//TODO: check if we need a design change, and if this will be a shared resource 
-//No need for sync mechanism, as it's been set at init and used, and it's const for all
+//two messages and for all !
 int msgid; 
+int msgid_ack;
 
 //Processes
 void ChildProcess();
 void ParentProcess();
 
 //Parent stuff
-//The thread function - the expiry notification function
+//the timer expiry notification function
 void ptimer_handler(int, siginfo_t*, void*, timer_t);
 timer_t setupTimer(int,int,int);
 void setAction(int, struct sigaction);
+static void CleanUp();
 
 //Child stuff
 void cthread_handler(void*);
 
 int main(int argc, char** argv){
     
+    //BUG_02: Global signal action for terminating and cleanup
+    //Note: Don't use signal() it might not be portable
+    //One exit point
+    struct sigaction tAction;
+    sigemptyset(&tAction.sa_mask);
+	tAction.sa_flags = SA_SIGINFO;
+	tAction.sa_sigaction = terminationHanlder;
+    setAction(SIGINT, tAction);
+
+    //Init msg queues
+    //REQ_GEN_003
+    msgid = initMsgQueue("projfile01", 65);
+    msgid_ack = initMsgQueue("projfile02", 66);
+
     //REQ_GEN_001
     switch (fork()) {
         case -1:
@@ -64,8 +93,11 @@ int main(int argc, char** argv){
 
             //close
             close(fd);
+            printf("File closed");
     }
 
+    rmMsgQueue(msgid);
+    rmMsgQueue(msgid_ack);
     return 0;
 }
 
@@ -73,19 +105,16 @@ void ChildProcess(){
     msg_t message, message_ack;
     childPid = getpid();
 
-    printf("The child process id: %d\n", childPid);
-    //REQ_GEN_003
-    int msgid = initMsgQueue("projfile01", 65);
-    int msgid_ack = initMsgQueue("projfile02", 66);
+    printf("The child process msgid id: %d\n", childPid);
     
     pthread_t cthreadId;
-    //TODO: custom thread attributes here
-    //No args as for the moment
+
+    //No thread args as for the moment
     //REQ_CHI_001
     pthread_create(&cthreadId,NULL,cthread_handler, NULL);
 
     //Prepare the message
-    while(1){
+    while(!terminationflag){
         // wait for messages
         //REQ_CHI_004
         recvMsg(&message, msgid);
@@ -97,54 +126,57 @@ void ChildProcess(){
         //ACK 
         //TODO: Check if one message queue only with msgtype changed
         message_ack.mtype = 2;
-        message.data.lifeCounter = ChildAge;
-        message.data.currentProcessID = getpid();
-        strcpy(message.data.msgText, "Greetings back from the child! I’m getting older!");
-        sendMsg(&message, msgid);
+        message_ack.data.lifeCounter = ChildAge;
+        message_ack.data.currentProcessID = getpid();
+        strcpy(message_ack.data.msgText, "Greetings back from the child! I’m getting older!");
+        //BUG_01 Was here !: Child was sending to itself, making the parent stuck !
+        //Previous: sendMsg(&message_ack, msgid);
+        sendMsg(&message_ack, msgid_ack);
 
         sleep(1);
     }
 
     //Terminate
-    rmMsgQueue(msgid);
+    printf("Terminating child\n");
     pthread_join(cthreadId, NULL);
-    exit(0);
+    exit(EXIT_SUCCESS);
 }
 
 void ParentProcess(){
     parentPid = getpid();
 
     printf("The parent process id: %d\n", parentPid);
-    //int msgid = initMsgQueue("projfile01", 65); 
-    //Make it global to be used in the timer, handler
-    //TODO: check if we need a design change, and if this will be a shared resource 
-    msgid = initMsgQueue("projfile01", 65);
 
-    //timer setup
-    struct sigaction actionProperty;
+    //timer thread firing setup
+    struct sigaction timerAction;
 
-	sigemptyset(&actionProperty.sa_mask);
-	actionProperty.sa_flags = SA_SIGINFO;
-	actionProperty.sa_sigaction = ptimer_handler;
-    setAction(SIGRTMAX, actionProperty);
-    setAction(SIGINT, actionProperty); //Set action for the timer termination
+	sigemptyset(&timerAction.sa_mask);
+	timerAction.sa_flags = SA_SIGINFO;
+	timerAction.sa_sigaction = ptimer_handler;
+    setAction(SIGRTMAX, timerAction);
 
     //REQ_PAR_001 - Periodic timer every 1 sec
     timerId = setupTimer(SIGRTMAX, 1000, 1);
 
-    while(1);
+    while(!terminationflag);
 
-    exit(0);
+    //Terminate
+    printf("Terminating parent\n");
+	clear_timer(timerId);
+    close(fd);
+    exit(EXIT_SUCCESS);
 }
 
 void cthread_handler(void* tparams){
     pthread_t tid = pthread_self();
-    //int ktid = gettid(); //Kernel thread id, it's not the same as returned from pthread_self();
 
-    while(1){
-        //TODO: to remove printf
+    while(!terminationflag){
         //REQ_CHI_002
+        //printf might cause problems while printing, not thread safe as it references stdout FILE* each time w/o sync
+        //as per posix, use flockfile(stdout) funlockfile(stdout) can be used only from one process
+        //TODO: use POSIX semaphores if needed
         printf("%u: Child is still alive!\n", pthread_self());
+
         //REQ_CHI_003
         ChildAge++;
         sleep(2);
@@ -153,11 +185,11 @@ void cthread_handler(void* tparams){
 
 //REQ_PAR_002
 void ptimer_handler(int _signalType, siginfo_t* info, void* context, timer_t _timerId){
-    //NOTE: Don't call prinf() here, it's not thread-safe
     if (_signalType == SIGRTMAX) {
-		//Send messages here
+		//Send the greating msg to the child
         msg_t message;
-        message.mtype = 1; //Per the man pages, this should be > 0
+
+        message.mtype = 1; //per the man pages, this should be > 0
         strcpy(message.data.msgText, "Greetings from parent");   
         message.data.lifeCounter = CurrentLifeTime;
         message.data.currentProcessID = getpid();
@@ -170,7 +202,6 @@ void ptimer_handler(int _signalType, siginfo_t* info, void* context, timer_t _ti
         //In SYSV IPC, no notify functions ?, check again
         //We can implement with using mq_* posix apis
         // wait for messages
-        int msgid_ack = initMsgQueue("projfile02", 66);
         msg_t msg_ack;
 
         //REQ_PAR_005
@@ -180,19 +211,13 @@ void ptimer_handler(int _signalType, siginfo_t* info, void* context, timer_t _ti
                     ,msg_ack.data.lifeCounter
                     ,msg_ack.data.currentProcessID);
 
-        //Log to file
+        //Log to file, file is written in parent only, no sync needed
         WriteLogToFile(msg_ack.data.msgText,fd);
 
 	}
-	else if (_signalType == SIGINT) {
-		clear_timer(_timerId);
-        close(fd);//TODO: TO MOVE THIS
-		perror("Exit, program interrupted");
-		exit(EXIT_FAILURE);
-	}
 }
 
-timer_t setupTimer(int signo, int usec, int mode){
+timer_t setupTimer(int signo, int msec, int mode){
     struct sigevent sigev;
 	timer_t timerid;
 	struct itimerspec itval;
@@ -204,8 +229,8 @@ timer_t setupTimer(int signo, int usec, int mode){
 	sigev.sigev_value.sival_ptr = &timerid;
 
 	if (timer_create(CLOCK_REALTIME, &sigev, &timerid) == 0) {
-		itval.it_value.tv_sec = usec / 1000;
-		itval.it_value.tv_nsec = (long)(usec % 1000) * (1000000L);
+		itval.it_value.tv_sec = msec / 1000;
+		itval.it_value.tv_nsec = (long)(msec % 1000) * (1000000L);
 
         //if continous mode or not
 		if (mode == 1) {
@@ -240,18 +265,38 @@ void clear_timer(timer_t _timerid){
 }
 
 static int openfile(){
-    int fd = open(logfile, O_RDWR | O_CREAT);
+    int fd = open(logfile, O_RDWR | O_CREAT, 0777);
     if(fd == -1){
-        perror("fileopen");
+        perror("file open failure");
         exit(EXIT_FAILURE);
+    }else{
+        printf("File opened with fd: %d\n", fd);
     }
 
     return fd;
 }
+
 static int WriteLogToFile(const char* log, int _fd){
     ssize_t sz = write(fd, log, strlen(log));
+    //close(fd);
     if (sz == -1){
-        perror("filewrite");
+        perror("file write failure");
         exit(EXIT_FAILURE);
+    }else{
+        
     }
+
+    return sz;
+}
+
+static void terminationHanlder(int signo, siginfo_t* info, void* args){
+    printf("Received termination interrupt\n");
+    CleanUp();//Cleanup hook
+    // Broadcast termination: You can kill the processes, 
+    //using the flag for every process to release its resources
+    terminationflag = 1;
+}
+
+static void CleanUp(){
+
 }
