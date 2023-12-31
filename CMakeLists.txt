@@ -5,4 +5,4 @@ add_executable(lad-posix main.c sysv_msg.c)
 
 target_link_libraries(lad-posix rt pthread)
 
-#install(TARGETS lad-posix DESTINATION bin)
+install(TARGETS lad-posix DESTINATION bin)
